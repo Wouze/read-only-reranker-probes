@@ -1,0 +1,441 @@
+\documentclass[11pt, a4paper]{article}
+
+\usepackage[a4paper, margin=2.5cm]{geometry}
+\usepackage{fontspec}
+\usepackage[english, bidi=basic, provide=*]{babel}
+\babelprovide[import, onchar=ids fonts]{english}
+\babelfont{rm}{Noto Sans}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{unicode-math}
+\setmathfont{Latin Modern Math}
+\setmathfont{Noto Sans}[range={up/num, "2C, "2E, "25}]
+\usepackage{array}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\grp}[1]{\multicolumn{5}{l}{\emph{#1}}\\}
+
+\title{Read-Only Probes for Early Exit\\in a Frozen Decoder Reranker\\[0.4em]\large Half the Latency of Qwen3-Reranker-4B within 0.0005 nDCG@10}
+\author{Mohammad Alkhenizan}
+\date{30 October 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Qwen3-Reranker-4B runs every passage through all 36 layers.
+This paper drops most passages part-way through the frozen model, using read-only probe tokens that read each passage's key/value cache and never write it.
+A cut rule fixed before any 4B probe score existed --- keep 60 at layer 9, 40 at layer 15, and 15 at layer 21 --- needs $0.558$ of the prefix-cached multiply-accumulates on stored states, at an nDCG@10 change of $-0.0001$ on a 400-query check split.
+On one RTX 3090, the schedule that keeps the frozen model's exact margins runs at $1.09\times$ the prefix-cached forward; scored once after the rule was hashed, it differs from the full model by $+0.0004$ nDCG@10 on Arabic MIRACL dev and $+0.0095$ on TREC DL19, and both 95\% intervals contain zero.
+Letting the late layers drift reaches $1{,}644$ ms against a $3{,}276$ ms baseline, half the latency, at an nDCG@10 drop of $+0.0005$, with the full model's top 10 intact on $0.80$ of queries.
+Gathering the work onto non-pad tokens reaches $2.29\times$ at a drop of $+0.0012$.
+All ratios are against the prefix-cached forward, not stock Hugging Face.
+\end{abstract}
+
+\section{Introduction}
+
+Pointwise decoder rerankers score a passage by reading a yes/no margin at one token.
+That margin sits at the end of a deep stack, so every passage pays every layer.
+Early-exit cascades score a prefix of the network, drop most of the list, and spend the remaining layers on a shortlist \cite{soldaini2020cascade,xin2020early,campagnano2025e2rank}.
+Those cascades train the model that is being exited.
+This paper keeps the reranker frozen and adds a handful of probe tokens that read the passage cache through their own low-rank weights.
+
+Three results follow.
+\begin{itemize}
+\item A cut rule written down before any 4B probe score existed keeps the full model's ranking on stored states at $0.558$ of the multiply-accumulates, and the same shape holds on the 0.6B and the 8B (Table~\ref{tab:mac}).
+\item Exact reuse is a bf16 problem, not a modeling one: on the passages tested, split and joint margins agree to $2\times 10^{-5}$ in fp32, while in bf16 reduction order moves them. The schedule that keeps exact bf16 margins is $1.09\times$; continuing from the document cache is $1.47\times$ (Table~\ref{tab:clock}).
+\item Relaxing the late layers --- a 192-token early horizon with the tails restored, a frozen document after layer 25, and a layer-25 ridge correction --- reaches half the latency at a check drop of $+0.00048$ (Table~\ref{tab:clock}).
+\end{itemize}
+
+Two cost measures appear and must not be multiplied.
+Multiply-accumulate (MAC) fractions are counted on stored states.
+Wall-clock ratios are measured on a 3090.
+Both are against a prefix-cached forward that computes the query once and projects only a two-logit margin.
+Stock Hugging Face costs $1.73\times$ that baseline in multiply-accumulates; multiplying $1.73\times$ by a wall-clock ratio is not a measured Hugging Face latency.
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Score}
+
+Qwen3-Reranker is a causal language model.
+The score of a passage is the difference between the yes and no rows of the output projection at the last suffix token.
+The instruction and the query form a prefix, computed once per query in the baseline.
+Each passage is the document tokens plus a short pinned suffix.
+Stock Hugging Face recomputes the prefix for every passage and projects every token onto the full vocabulary.
+On the pilot lists (mean prefix 77 tokens, mean document plus suffix 133) that costs $2.08\times$, $1.73\times$, and $1.71\times$ the baseline in multiply-accumulates for the 0.6B, 4B, and 8B.
+
+\subsection{Probe tokens}
+
+Under the causal mask, the first tokens of a document have the same states whether or not the rest of the document follows, and tokens placed after a document can read its key/value cache without changing it.
+A probe can therefore score a passage at an intermediate layer, and a survivor can continue the same forward to the dense margin.
+
+The probe is nine tokens, initialized from the suffix embeddings.
+One rank-16 LoRA, scale 2, shared across layers, adapts the query, key, value, output, and three MLP projections of the probe path only; the document weights receive no gradient.
+Exit heads sit at layers 4, 6, 8, 9, 10, 11, 12, 13, 14, 15, and 16, and the cascade reads layers 9 and 15.
+The loss is a within-query centered mean squared error plus a listwise KL to the teacher margins.
+The 0.6B probe is trained for three epochs on 2,016 fit queries; the 4B and 8B probes use the same recipe on the first 600.
+Continuing the layer-9 probe residual to layer 15, instead of restarting it at layer 0, matches the fresh head to a maximum absolute difference of $0.0000$ and takes the timed cascade from 2,935 ms to 2,846 ms on 30 pilot queries.
+
+A ridge head is the other stage: a within-query centered linear map from the RMS-normalized last suffix state at one layer to the final margin.
+The 4B layer-21 ridge uses regularization $10^{-3}$ and has held-out within-query correlation $0.994$.
+
+\subsection{A rule fixed in advance}
+
+The 0.6B search was led by full-document probe cascades.
+Before any 4B full-probe score existed, three 4B rules were written down by scaling those layer indices from 28 layers to 36.
+The rule reported here is the first:
+
+\begin{center}
+probe at layer 9, keep 60;\quad
+probe at layer 15, keep 40;\quad
+ridge at layer 21, keep 15;\quad
+then the frozen margin.
+\end{center}
+
+A later cut ranks above an earlier cut, and inside the last cut the order is the frozen margin.
+The keep rule retains every passage tied with the $K$th, so a cut can exceed $K$.
+The rule file was hashed (SHA-256 \texttt{750cc36\ldots96b43e}) before Arabic dev or TREC DL19 was opened, and the scorer refuses those sets if the file does not match.
+
+\subsection{What bf16 does to exact reuse}
+\label{sec:bf16}
+
+A joint forward of document plus suffix matches the manual scorer to $0.0000$.
+A document-only residual and the same tokens inside a joint sequence still diverge in bf16, because the two sequence lengths take different matmul and attention reductions; He et al.\ \cite{he2025nondeterminism} show the same dependence on batch size.
+On check query 12856 (documents of 10, 62, and 504 tokens) the bf16 margin gap is at most $0.040$ and the layer-35 hidden state differs by as much as 20; on three other check passages the gap reached $0.16$.
+In fp32 with tf32 disabled the same three passages agree to $1.9\times 10^{-5}$, although the hidden state still moves by about $0.004$ after 36 layers.
+Probe scores are not affected: they were trained on document-only states, and the layer-9 probe matched stored scores to $0.0000$ on three check queries.
+
+The exact schedule therefore runs both probes on document-only states and restarts the forty layer-15 survivors from layer 0 as document-plus-suffix sequences.
+Those fifteen the ridge keeps continue to layer 35 in that same sequence, so their margin is the frozen model's.
+The cost is that layers 0--15 of those forty passages are paid twice.
+
+\section{Setup}
+
+Models are Qwen3-Reranker-0.6B, 4B, and 8B in bf16.
+Arabic lists are drawn from the MIRACL training queries after a sealed 261-query holdout, 100 passages each: 200 pilot queries for search, 2,016 for fitting, and 400 for confirmation.
+Public scores use the existing MIRACL Arabic dev top 100 (2,896 queries) and TREC DL19 top 100 (43 queries), with saved 4B scores as the reference ranking and MTEB relevance labels.
+
+Quality is measured against the frozen model on the same top-100 lists:
+\emph{drop} is reference nDCG@10 minus cascade nDCG@10 (positive means the cascade is worse);
+\emph{Jaccard@10} is the overlap of the two top-10 sets;
+\emph{cover} is the fraction of queries whose entire reference top 10 survives every cut.
+Check reference nDCG@10 is $0.7284$, $0.7685$, and $0.7726$ for the 0.6B, 4B, and 8B.
+The bf16 forward is within $0.001$ nDCG and $0.977$ Jaccard@10 of fp32, which is the noise floor of the stored-score tables.
+MAC fractions count linear layers and attention, including probe tokens and work on passages that are later dropped.
+
+\section{Results}
+
+\subsection{Stored states: the rule and its variants}
+
+Table~\ref{tab:mac} scores the pre-registered rule from stored hidden states on all three models.
+Table~\ref{tab:variants} scores the 4B alternatives on the same states.
+None of these rows is a timed schedule.
+
+\begin{table}[t]
+\centering
+\caption{The pre-registered rule on stored states, 400-query check split. MACs are relative to the prefix-cached model.}
+\label{tab:mac}
+\begin{tabular}{llccc}
+\toprule
+Model & Rule & MACs & Drop & Jaccard@10 \\
+\midrule
+0.6B & probe@7/60, probe@12/40, ridge@16/15 & 0.568 & $-0.0001$ & 0.956 \\
+4B & probe@9/60, probe@15/40, ridge@21/15 & 0.558 & $-0.0001$ & 0.956 \\
+8B & the same 4B rule & 0.565 & $-0.0007$ & 0.966 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\small
+\caption{4B variants on stored states, 400-query check split. Ridge rows attach the suffix from layer 0 and are fit on the first 600 fit queries. A dash means the value was not recorded for that variant.}
+\label{tab:variants}
+\begin{tabular}{lcccc}
+\toprule
+Variant & MACs & Drop & Jaccard@10 & Cover \\
+\midrule
+\grp{Probe}
+Pre-registered rule, nine probe tokens & 0.558 & $-0.0001$ & 0.956 & 0.820 \\
+One probe token & 0.558 & $0.0000$ & 0.957 & 0.815 \\
+Pre-registered rule 2, last cut at layer 23 & 0.534 & $-0.0011$ & 0.934 & --- \\
+Pre-registered rule 3, last cut at layer 23 & 0.494 & $-0.0017$ & 0.898 & --- \\
+Probes enter at layers 6 and 12, embedding init & 0.574 & --- & --- & 0.775 \\
+Probes enter at layers 6 and 12, document-state init & 0.537 & $-0.0001$ & --- & 0.810 \\
+\midrule
+\grp{Ridge instead of the probes}
+Ridge at layers 9, 15, and 21 & 0.553 & $+0.0089$ & 0.903 & 0.625 \\
+\midrule
+\grp{Last cut at layer 19 instead of 21}
+Ridge on the last suffix token, or the last four & --- & --- & --- & 0.655 \\
+Ridge on all nine suffix tokens & 0.543 & $+0.0004$ & 0.945 & 0.768 \\
+\midrule
+\grp{Other cut scores}
+Unused early exits, combined on the fit split & 0.557 & $-0.0002$ & 0.952 & 0.810 \\
+Gap to the 10th score, fit MACs held at 0.558 & 0.575 & --- & --- & 0.818 \\
+Gap to the 10th score, fit cover held at 0.820 & 0.513 & --- & --- & 0.703 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two layer-23 rules from the same pre-registration are cheaper but lose top-10 agreement, and the floor sits near $0.45$--$0.55$ of the multiply-accumulates because every passage still pays the early layers.
+One learned token reads the document cache as well as nine.
+Ridges are not early rankers: held-out within-query correlation is $0.672$, $0.894$, and $0.994$ at layers 9, 15, and 21, and replacing the probes with ridges loses a reference top-10 passage on 37.5\% of queries.
+At layer 19 the ranking is spread across the suffix, and the last token gathers it only by layer 21.
+The retriever score at layer 9 adds nothing: $0.979$ of the reference top 10 already survive that cut, and blending in the retriever keeps $0.980$.
+Charging the document-state probes from their entry layer instead of layer 0 lowers their MAC fraction from $0.537$ to $0.534$.
+
+\subsection{Wall-clock}
+\label{sec:clock}
+
+Table~\ref{tab:clock} lists every timed schedule on one RTX 3090 with the 4B in bf16.
+Its first group pairs each schedule with its own prefix-cached run on 30 pilot queries after two warmup queries; the pilot was used to search cascades, but not these timings.
+The second group is GPU-synchronized means of eight check queries against the $3{,}276$ ms prefix-cached mean of a ten-query synchronized pilot profile, so those ratios cross two query sets.
+Quality columns are the 400-query check split.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Timed schedules on the pre-registered $(60, 40, 15)$ rule, 4B, one RTX 3090. Ratio is baseline over schedule. The exact row's p95 is 4,107 ms against 4,398 ms ($1.07\times$). Rows from Head-192 down use the one-token probe.}
+\label{tab:clock}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrcccc}
+\toprule
+Schedule & Base ms & ms & Ratio & Drop & Jaccard@10 & Cover \\
+\midrule
+\multicolumn{7}{l}{\emph{Full documents; 30 pilot queries, each against its own baseline}} \\
+Exact: restart survivors at layer 0 & 3199 & 2942 & $1.09\times$ & $+0.0002$ & 0.945 & 0.823 \\
+Suffix from layer 0, all passages & 3179 & 2247 & $1.41\times$ & $-0.00002$ & 0.944 & 0.815 \\
+Catch-up, layer-15 probe restarted & 3163 & 2250 & $1.41\times$ & --- & --- & --- \\
+Tier A: catch-up, nine-token probe & 3152 & 2149 & $1.47\times$ & $+0.0012$ & 0.945 & 0.820 \\
+Tier A: catch-up, one-token probe & 3162 & 2085 & $1.52\times$ & $+0.0020$ & 0.945 & 0.813 \\
+\midrule
+\multicolumn{7}{l}{\emph{Relaxed; 8 synced check queries against the 3,276 ms pilot profile}} \\
+Head-192, tails dropped & 3276 & 1539.4 & $2.13\times$ & $+0.01156$ & 0.874 & 0.6850 \\
+TailCatch, tails restored & 3276 & 1878.2 & $1.74\times$ & $+0.00075$ & 0.941 & 0.7975 \\
+TailCatch + freeze after layer 25 & 3276 & 1643.5 & $1.99\times$ & $+0.00176$ & 0.940 & 0.7975 \\
+Tier B: + layer-25 blend, $\alpha = 0.15$ & 3276 & 1643.5 & $1.99\times$ & $+0.00048$ & 0.938 & 0.7975 \\
+Tier C: + compaction, $\alpha = 0$ & 3276 & 1430.2 & $2.29\times$ & $+0.00123$ & 0.939 & 0.7975 \\
+Tier C, blend left on & 3276 & 1430.2 & $2.29\times$ & $+0.00181$ & 0.939 & 0.7975 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Exact schedule.}
+Table~\ref{tab:parts} splits it on ten synchronized pilot queries; the syncs raise both sides (baseline 3,294 ms, cascade 3,056 ms), so it is an account of the schedule rather than a second latency.
+The restart is the largest step, probes are about a tenth of the time, and the top of the stack is less efficient per token than the hundred-passage batch.
+Together these turn a $0.558$ MAC fraction into $1.09\times$.
+
+\begin{table}[t]
+\centering
+\caption{Where one exact-schedule query spends its time. Mean of 10 synchronized pilot queries. Token counts are means; on the profiled query the first cut kept 61 passages because of ties.}
+\label{tab:parts}
+\begin{tabular}{lrr}
+\toprule
+Step & Tokens & Time \\
+\midrule
+Layers 0--9, all 100 passages & 12,619 & 869 ms \\
+Probe at layer 9 & --- & 141 ms \\
+Layers 10--15, passages kept at layer 9 & 8,600 & 364 ms \\
+Probe at layer 15 & --- & 153 ms \\
+Restart 40 passages, layers 0--21, with suffix & 6,619 & 1,091 ms \\
+Layers 22--35, final 15 & 2,467 & 323 ms \\
+Cache copies and host work (unpad 23, re-pad 15, other 77) & --- & 115 ms \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Continuing from the document cache (Tier A).}
+Instead of restarting, the suffix catch-up keeps the document cache after layer 15, runs the nine suffix tokens through layers 0--15 against it, and continues document and suffix together from layer 16.
+Its cuts keep the same reference passages as the exact schedule (cover $0.820$ against $0.823$, identical Jaccard@10), so the gap between drops of $+0.0002$ and $+0.0012$ is the order of the finalists.
+Over 6,003 finalist scores the mean absolute margin gap against the joint forward is $0.035$ and the maximum is $0.275$.
+Attaching the suffix from layer 0 on all 100 passages misses by $0.034$ and $0.277$, because the survivor batch shrinks with the cuts and batch size moves the bf16 reductions the same way sequence length does \cite{he2025nondeterminism}.
+
+\paragraph{Relaxed schedules (Tiers B and C).}
+\label{sec:tiers}
+In the synchronized profile the one-token catch-up takes $2{,}154$ ms, and $977$ ms of it is layers 0--9, which every passage pays.
+Going past $2\times$ means doing less work inside the document forward, and each step below moves finalist margins.
+\begin{itemize}
+\item \emph{Head-192} runs layers 0--15 on the first 192 tokens ($83\%$ of tokens; $17.3\%$ of check passages are longer). The probes are not the loss: scoring its layer-15 survivors with full-document margins gives a drop of $0.0000$. The loss is long passages at the ridge and the final margin: against the full-text cascade it adds 168 missed reference top-10 slots on long passages ($+4$ at layer 9, $+6$ at layer 15, $+59$ at the ridge, $+99$ among finalists), and one on short passages.
+\item \emph{TailCatch} runs \texttt{doc[192:]} through layers 0--15 for the long layer-15 survivors before the ridge, then continues on the full passage. Concatenating that tail with the suffix brings it from $1{,}878.2$ ms to $1{,}838.8$ ms with the same top 10 on the eight timing queries.
+\item \emph{Freeze after layer 25} advances only the nine suffix tokens through layers 26--35, attending to the prefix cache and themselves. The candidate set is unchanged, but finalist margins move by up to $0.50$.
+\item \emph{Layer-25 ridge blend} scores finalists as $(1-\alpha)$ of the frozen margin plus $\alpha$ of a ridge on the last suffix state after layer 25, fit on the 15 finalists of the 600 fit queries (held-out correlation $0.9991$). $\alpha = 0.15$ was chosen on a 90-query fit slice. It adds no layer calls.
+\item \emph{Compaction} gathers QKV, the output projection, and the SwiGLU MLP onto non-pad tokens; length-sorted chunks at a $4{,}000$-token budget are still $24.8\%$ padding. It saves $235.2$ ms in a paired run ($1{,}665.4$ to $1{,}430.2$ ms) but changes the bf16 GEMM shapes and moves finalist margins by up to $0.147$, so the layer-25 blend fit on uncompacted states no longer helps.
+\end{itemize}
+Table~\ref{tab:pruned} and Table~\ref{tab:speed} list the variations that were measured and not kept.
+Trimming the keep rule to $(48, 28, 15)$ saves $91$ ms compacted and $113$ ms uncompacted but drops cover from $0.7975$ to $0.665$, so the pre-registered keep stays the primary schedule.
+
+\subsection{Scores that were not used to choose the rule}
+
+Table~\ref{tab:public} is the exact schedule, scored once on each public set after the rule was hashed.
+TREC DL19 uses the Arabic rule with no English refit; its top-10 overlap falls to $0.770$, and one English set is not a language-transfer curve.
+
+\begin{table}[t]
+\centering
+\caption{The hashed 4B rule under the exact schedule, scored once. The interval is a paired bootstrap (10,000 resamples) of cascade minus full model.}
+\label{tab:public}
+\begin{tabular}{lccccc}
+\toprule
+Set & Queries & Full 4B & Cascade & Jaccard@10 & 95\% interval \\
+\midrule
+Arabic MIRACL dev & 2,896 & 0.7495 & 0.7499 & 0.905 & $[-0.0011,\, +0.0019]$ \\
+TREC DL19 & 43 & 0.7487 & 0.7582 & 0.770 & $[-0.0048,\, +0.025]$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Related work}
+
+Soldaini and Moschitti \cite{soldaini2020cascade} turn one encoder into a stack of rankers that share the partial encoding and report a 37\% cut in computation.
+Xin et al.\ \cite{xin2020early} exit BERT early for ranking and report up to $2.5\times$ lower latency against that cascade.
+E2Rank \cite{campagnano2025e2rank} runs deeper cross-encoder layers on a narrowed set.
+The cascade shape is theirs; here the reranker is not trained, the probes do not update the passage, and in the exact schedule the survivor score is the frozen model's own margin.
+
+Matryoshka Re-Ranker \cite{liu2025matryoshka} trains yes-heads at intermediate depths and pools width with LoRA and self-distillation, so the scored model is the compressed one.
+SwiftKV \cite{swiftkv2024} fills later key/value caches from an earlier hidden state so prefill can skip layers; the probe does the opposite and leaves the passage cache as the frozen model's.
+DoPR \cite{dai2026dopr} compresses a document prefix offline and reuses it across queries, reporting up to $8.04\times$ online latency on long documents and 97.1--99.5\% of full-document nDCG@10 on Qwen3 rerankers from 0.6B to 8B; its DL19 online speedups are $1.21\times$, $1.59\times$, and $1.84\times$.
+That saving is across queries; the saving here is inside one query.
+
+\section{Limits}
+
+\begin{itemize}
+\item The $0.558$ MAC fraction is not a 3090 speedup; the exact schedule that realizes it is $1.09\times$.
+\item Only the exact schedule reproduces the joint bf16 margins. Tier A moves them by $0.035$ on average. In Tiers B and C the layer-25 freeze moves them by up to $0.50$, and compaction by up to $0.147$ more.
+\item The $1.99\times$ and $2.29\times$ ratios compare eight check queries against a ten-query pilot baseline.
+\item Arabic dev and DL19 were scored only under the exact schedule, and the DL19 gain of $0.0095$ has an interval that contains zero.
+\item No paged key/value cache was built, and the 261-query holdout is still sealed.
+\end{itemize}
+
+\begin{thebibliography}{9}
+
+\bibitem{campagnano2025e2rank}
+Cesare Campagnano, Antonio Mallia, Jack Pertschuk, and Fabrizio Silvestri.
+\newblock E2Rank: Efficient and effective layer-wise reranking.
+\newblock In \emph{Advances in Information Retrieval: 47th European Conference on Information Retrieval}, pages 417--426, 2025.
+
+\bibitem{dai2026dopr}
+Beiya Dai, Yifan Wei, Guang Yang, Xing Shi, Xinbing Wang, and Zhouhan Lin.
+\newblock DoPR: Reusable compressed document prefixes for efficient LLM reranking, 2026.
+
+\bibitem{he2025nondeterminism}
+Horace He et~al.
+\newblock Defeating nondeterminism in LLM inference.
+\newblock Thinking Machines Lab, 2025.
+
+\bibitem{liu2025matryoshka}
+Zheng Liu, Chaofan Li, Shitao Xiao, Chaozhuo Li, Defu Lian, and Yingxia Shao.
+\newblock Matryoshka re-ranker: A flexible re-ranking architecture with configurable depth and width, 2025.
+
+\bibitem{swiftkv2024}
+Aurick Qiao, Zhewei Yao, Samyam Rajbhandari, and Yuxiong He.
+\newblock SwiftKV: Fast prefill-optimized inference with knowledge-preserving model transformation, 2024.
+
+\bibitem{soldaini2020cascade}
+Luca Soldaini and Alessandro Moschitti.
+\newblock The cascade transformer: an application for efficient answer sentence selection.
+\newblock In \emph{Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics}, pages 5697--5708, 2020.
+
+\bibitem{xin2020early}
+Ji~Xin, Rodrigo Nogueira, Yaoliang Yu, and Jimmy Lin.
+\newblock Early exiting BERT for efficient document ranking.
+\newblock In \emph{Proceedings of SustaiNLP: Workshop on Simple and Efficient Natural Language Processing}, pages 83--88, 2020.
+
+\end{thebibliography}
+
+\appendix
+
+\section{Pruned paths}
+\label{app:pruned}
+
+Table~\ref{tab:pruned} lists pruned schedules that were scored on the check split, and Table~\ref{tab:speed} lists paths that were stopped on speed or on the pilot split.
+
+\begin{table}[h]
+\centering
+\small
+\caption{Pruned schedules, 400-query check split. Times are synchronized means of the eight check queries of Table~\ref{tab:clock}. Unless noted, rows are TailCatch with the layer-25 freeze; $\alpha$ is the layer-25 blend weight.}
+\label{tab:pruned}
+\begin{tabular}{lrccc}
+\toprule
+Schedule & ms & Drop & Jaccard@10 & Cover \\
+\midrule
+\multicolumn{5}{l}{\emph{Tighter keep rules}} \\
+$(60, 28, 15)$, $\alpha = 0$ & 1569.4 & $+0.00039$ & 0.927 & 0.7425 \\
+$(60, 28, 15)$, $\alpha = 0.15$ & 1569.4 & $+0.00111$ & 0.926 & 0.7425 \\
+$(60, 28, 15)$ compacted, $\alpha = 0$ & 1342.3 & $+0.00271$ & 0.928 & 0.7425 \\
+$(60, 28, 15)$ compacted, $\alpha = 0.15$ & 1342.3 & $+0.00240$ & 0.926 & 0.7425 \\
+$(48, 28, 15)$ & 1530.8 & $-0.00031$ & 0.907 & 0.6650 \\
+$(48, 28, 15)$ compacted, $\alpha = 0$ & 1339.3 & $-0.00006$ & 0.907 & 0.6675 \\
+$(48, 28, 15)$ compacted, $\alpha = 0.15$ & 1339.3 & $-0.00036$ & 0.907 & 0.6675 \\
+$(48, 24, 15)$ & 1530.0 & $+0.00097$ & 0.900 & 0.6375 \\
+$(48, 24, 10)$ & 1491.3 & $+0.00088$ & 0.819 & 0.305 \\
+$(48, 24, 10)$, no freeze & 1590.7 & $+0.00081$ & 0.819 & 0.305 \\
+\midrule
+\multicolumn{5}{l}{\emph{Shorter horizons and tail caps}} \\
+First 128 tokens, tails restored, keep $(56, 28, 15)$ & 1506.3 & $+0.00047$ & 0.903 & 0.630 \\
+Restored tail capped at 256 tokens, no freeze & 1720 & $+0.00885$ & 0.906 & 0.755 \\
+Nine-token probe on the first 80 tokens & --- & $+0.0018$ & 0.929 & 0.738 \\
+Nine-token probe on the first 64 tokens & --- & $+0.0036$ & --- & 0.723 \\
+\midrule
+\multicolumn{5}{l}{\emph{Compacting layers 0--15 only}} \\
+$(60, 40, 15)$, $\alpha = 0$ & 1540.5 & $+0.00307$ & 0.939 & 0.7925 \\
+$(60, 40, 15)$, $\alpha = 0.15$ & 1540.5 & $+0.00292$ & 0.938 & 0.7925 \\
+$(60, 28, 15)$, $\alpha = 0$ & 1451.9 & $+0.00207$ & 0.927 & 0.7425 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+With $K_{21} = 10$ the top-10 set is fixed at the layer-21 ridge, which is why cover falls to $0.305$.
+The 128-token horizon is about 25 ms faster than $(48, 28, 15)$ at lower cover.
+Compacting only layers 0--15 saves $105$ ms on $(60, 40, 15)$ (from $1{,}645.1$ ms) and $94$ ms on $(60, 28, 15)$ (from $1{,}545.6$ ms), but the later layers continue from the gathered state, so finalist margins still move by up to $0.226$.
+
+\begin{table}[h]
+\centering
+\small
+\caption{Paths stopped on speed or on the pilot split. Overlap is pilot top-10 overlap with the full model.}
+\label{tab:speed}
+\begin{tabular}{l>{\raggedright\arraybackslash}p{7.4cm}}
+\toprule
+Path & Result \\
+\midrule
+\multicolumn{2}{l}{\emph{Tails and horizons}} \\
+Tail capped at 288 or 320 tokens & 1,800 and 1,869 ms (TailCatch 1,878.2 ms) \\
+Tails restored for the top 20 or 25 only & 1,973 and 2,029 ms \\
+First 128 tokens at $(60, 28, 15)$; first 144 & 1,515.6 ms; 1,544.1 ms \\
+Head-and-tail slices \texttt{64+64}, \texttt{96+96} & Linear nDCG drop 0.027 and 0.015; contiguous 128 and 192: 0.014 and 0.0024 \\
+Rescore the 3.8 long Head-192 finalists & $+366$ ms; the 76 queries that lost a long reference passage earlier stay lost \\
+Layer-6 pre-cut before $60/40$ & Oracle cover 0.818 at keep 75, 0.798 at keep 72 (stored nine-token scores) \\
+\midrule
+\multicolumn{2}{l}{\emph{Batching and the late freeze}} \\
+15 finalists in one padded chunk & 2,138 ms \\
+Late-layer token budget 8,000 & 2,090 ms; layers 22--35 rise from 294 to 450 ms \\
+Global budget 8,000 or 16,000 (from 4,000) & 2,527 or 3,110 ms (from 2,154); padding 37.1\% or 50.7\% (from 24.8\%) \\
+25 active tokens after layer 25 instead of 9 & 1,694 ms against 1,671 ms \\
+Freeze at layer 27 or 29 instead of 25 & 1,717 and 1,761 ms \\
+Defer document work at exit layers & 2,105 to 2,084 ms ($1.01\times$); margins move up to 0.040 \\
+\midrule
+\multicolumn{2}{l}{\emph{Kernels}} \\
+FlexAttention, one call & $9\times$ (3.10 to 0.34 ms), plus 2.9 ms per batch for the mask \\
+FlexAttention, end to end & Full model 3,300 to 3,113 ms ($1.06\times$); catch-up 2,191 to 2,053 ms ($1.07\times$); margins move up to 0.17 \\
+Fused QKV and gate/up & 3,294 to 3,316 ms, margin gap 0.34; compiled 3,117 ms ($1.06\times$), gap 0.54 \\
+\texttt{int8} GEMMs & $1.04\times$ gate/up, $1.05\times$ down, $1.19\times$ QKV; errors of several units \\
+\midrule
+\multicolumn{2}{l}{\emph{Pruning the model}} \\
+Skip every other layer & 1,673 ms ($1.97\times$); overlap 0.15, 0.20 after 200 steps of rank-8 repair, 0.08 on early odd layers \\
+Drop odd-layer MLPs & 2,560 ms; overlap 0.09 (early only 0.01, late only 0.65) \\
+Keep 75, 50, or 25\% of SwiGLU neurons & Overlap 0.75, 0.22, 0.12 at 2,995, 2,634, 2,263 ms \\
+Distill the half-neuron MLP (16 queries) & 1,833 ms (catch-up 2,287); fit overlap 0.77, held-out 0.60 to 0.53 \\
+\midrule
+\multicolumn{2}{l}{\emph{0.6B reranker (835 ms) as a shortlist for the 4B catch-up}} \\
+Keep 40 & 2,435 ms, slower than the catch-up alone (2,216 ms); recall 0.969, ceiling drop $-0.0004$ \\
+Keep 15 or 30 & 1,716 or 2,112 ms; ceiling drop $+0.0034$ or $+0.0042$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+In a profile of the catch-up, bf16 tensor-core GEMMs are about $35\%$ of CUDA time and elementwise kernels about $25\%$.
+Wider batches add padding, not fewer weight reads: pad tokens enter the GEMMs and the SwiGLU MLP, so a second narrow chunk is cheaper than one padded chunk.
+
+\end{document}

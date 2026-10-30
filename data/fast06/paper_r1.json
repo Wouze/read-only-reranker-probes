@@ -1,0 +1,23 @@
+{
+  "final": "exact margin of the last survivors",
+  "model": "Qwen/Qwen3-Reranker-4B",
+  "name": "R1",
+  "probe": "q4_full",
+  "stages": [
+    {
+      "keep": 60,
+      "kind": "probe",
+      "layer": 9
+    },
+    {
+      "keep": 40,
+      "kind": "probe",
+      "layer": 15
+    },
+    {
+      "keep": 15,
+      "kind": "ridge",
+      "layer": 21
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "pins": {
+    "instruction": "Given a web search query, retrieve relevant passages that answer the query",
+    "yes_id": 9693,
+    "no_id": 2152,
+    "max_len": 1024,
+    "prefix": "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n",
+    "suffix": "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n\n"
+  }
+}

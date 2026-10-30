@@ -1,0 +1,34 @@
+{
+  "model": "Qwen/Qwen3-Reranker-4B",
+  "rule": "probe at layer 9 keep 60; probe at layer 15 keep 40; ridge at layer 21 keep 15",
+  "rule_sha256": "750cc3641a728eac51426765e8db15a014ab71e314e0ccf55540ccd45996b43e",
+  "drop": "frozen-model nDCG@10 minus cascade nDCG@10; positive means the cascade is worse",
+  "cover": "fraction of queries whose entire reference top 10 survives every cut",
+  "ratios_are": "wall-clock against the prefix-cached forward, not stock Hugging Face",
+  "stored_states_check_400": [
+    {"model": "0.6B", "rule": "probe@7/60, probe@12/40, ridge@16/15", "macs": 0.568, "drop": -0.0001, "jaccard@10": 0.956},
+    {"model": "4B", "rule": "probe@9/60, probe@15/40, ridge@21/15", "macs": 0.558, "drop": -0.0001, "jaccard@10": 0.956, "cover": 0.820},
+    {"model": "8B", "rule": "the same 4B rule", "macs": 0.565, "drop": -0.0007, "jaccard@10": 0.966}
+  ],
+  "timed_4b_rtx3090": {
+    "full_document_30_pilot_queries_own_baseline": [
+      {"schedule": "exact restart at layer 0", "baseline_ms": 3199, "ms": 2942, "ratio": 1.09, "drop": 0.0002, "jaccard@10": 0.945, "cover": 0.823},
+      {"schedule": "suffix from layer 0, all passages", "baseline_ms": 3179, "ms": 2247, "ratio": 1.41, "drop": -0.00002, "jaccard@10": 0.944, "cover": 0.815},
+      {"schedule": "tier A suffix catch-up, nine-token probe", "baseline_ms": 3152, "ms": 2149, "ratio": 1.47, "drop": 0.0012, "jaccard@10": 0.945, "cover": 0.820},
+      {"schedule": "tier A suffix catch-up, one-token probe", "baseline_ms": 3162, "ms": 2085, "ratio": 1.52, "drop": 0.0020, "jaccard@10": 0.945, "cover": 0.813}
+    ],
+    "relaxed_8_check_queries_against_3276ms_pilot_profile": [
+      {"schedule": "head-192, tails dropped", "ms": 1539.4, "ratio": 2.13, "drop": 0.01156, "jaccard@10": 0.874, "cover": 0.685},
+      {"schedule": "tailcatch, tails restored", "ms": 1878.2, "ratio": 1.74, "drop": 0.00075, "jaccard@10": 0.941, "cover": 0.7975},
+      {"schedule": "tailcatch + freeze after layer 25", "ms": 1643.5, "ratio": 1.99, "drop": 0.00176, "jaccard@10": 0.940, "cover": 0.7975},
+      {"schedule": "tier B, layer-25 blend alpha 0.15", "ms": 1643.5, "ratio": 1.99, "drop": 0.00048, "jaccard@10": 0.938, "cover": 0.7975},
+      {"schedule": "tier C, compaction, alpha 0", "ms": 1430.2, "ratio": 2.29, "drop": 0.00123, "jaccard@10": 0.939, "cover": 0.7975},
+      {"schedule": "tier C with the tier B blend left on", "ms": 1430.2, "ratio": 2.29, "drop": 0.00181, "jaccard@10": 0.939, "cover": 0.7975}
+    ]
+  },
+  "scored_once_exact_schedule": [
+    {"set": "Arabic MIRACL dev", "queries": 2896, "full": 0.7495, "cascade": 0.7499, "jaccard@10": 0.905, "interval_95": [-0.0011, 0.0019]},
+    {"set": "TREC DL19", "queries": 43, "full": 0.7487, "cascade": 0.7582, "jaccard@10": 0.770, "interval_95": [-0.0048, 0.025]}
+  ],
+  "not_included": "Per-query rankings, the check and pilot lists, dev and DL19 lists, and the 261-query holdout are not in this repository."
+}
